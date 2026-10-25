@@ -19,6 +19,12 @@ const ROUTER_ACK_ENDPOINT = process.env.ROUTER_ACK_ENDPOINT || 'RouterJoinAck';
 const USERGET_RESP_ENDPOINT = process.env.USERGET_RESP_ENDPOINT || 'UserGetResponse';
 const MATCH_ROUTER_JOIN = new RegExp(process.env.MATCH_ROUTER_JOIN || 'routerjoin', 'i');
 const MATCH_USER_GET = new RegExp(process.env.MATCH_USER_GET || '^userget$', 'i');
+// Debug switches (set in Render > Environment, no code change needed):
+//   GREET=ack  -> send RouterJoinAck as soon as a client connects (tests "client waits for server first")
+//   AUTO_ACK=1 -> for unknown endpoints reply with the same service and endpoint+'Ack'
+const GREET = process.env.GREET || '';
+const AUTO_ACK = process.env.AUTO_ACK === '1';
+const ROUTER_SERVICE = process.env.ROUTER_SERVICE || 'Router';
 
 // ---------------------------------------------------------------- FlatBuffers reader
 function readTable(buf, pos) {
@@ -179,14 +185,21 @@ const hex = (b, n = 96) => b.subarray(0, n).toString('hex') + (b.length > n ? '.
 wss.on('connection', (ws, req) => {
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
+  const t0 = Date.now();
   console.log(`[+] connect path=${req.url} ip=${req.headers['x-forwarded-for'] || req.socket.remoteAddress}`);
+  const hdrs = { ...req.headers }; delete hdrs.cookie; delete hdrs.authorization;
+  console.log(`[H] ${JSON.stringify(hdrs)}`);
   let playerId = null;
+  ws.on('ping', (d) => console.log(`[ping from client] ${d.length}B`));
+  ws.on('pong', () => console.log('[pong from client]'));
 
   const send = (service, endpoint, payload, seq) => {
     const pkt = makePacket(service, endpoint, payload, seq, playerId || '');
     ws.send(pkt, { binary: true });
     console.log(`[>] ${service}/${endpoint} seq=${seq} payload=${payload ? payload.length : 0}B`);
   };
+
+  if (GREET === 'ack') send(ROUTER_SERVICE, ROUTER_ACK_ENDPOINT, Buffer.alloc(0), 0);
 
   ws.on('message', (data, isBinary) => {
     const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
@@ -208,10 +221,11 @@ wss.on('connection', (ws, req) => {
       send(p.service, USERGET_RESP_ENDPOINT, makeUserGetResponse(playerId, name), p.sequenceId);
     } else {
       console.log('[?] unhandled endpoint - add a handler once the real name/format is known');
+      if (AUTO_ACK) send(p.service, p.endpoint + 'Ack', Buffer.alloc(0), p.sequenceId);
     }
   });
 
-  ws.on('close', (c) => console.log(`[-] close code=${c}`));
+  ws.on('close', (c, r) => console.log(`[-] close code=${c} reason=${r && r.toString()} after=${Date.now() - t0}ms`));
   ws.on('error', (e) => console.log(`[!] ws error ${e.message}`));
 });
 
