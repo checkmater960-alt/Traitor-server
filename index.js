@@ -15,16 +15,19 @@ const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 3000;
-const ROUTER_ACK_ENDPOINT = process.env.ROUTER_ACK_ENDPOINT || 'RouterJoinAck';
-const USERGET_RESP_ENDPOINT = process.env.USERGET_RESP_ENDPOINT || 'UserGetResponse';
-const MATCH_ROUTER_JOIN = new RegExp(process.env.MATCH_ROUTER_JOIN || 'routerjoin', 'i');
-const MATCH_USER_GET = new RegExp(process.env.MATCH_USER_GET || '^userget$', 'i');
+const ROUTER_ACK_ENDPOINT = process.env.ROUTER_ACK_ENDPOINT || 'JA';
+const USERGET_RESP_ENDPOINT = process.env.USERGET_RESP_ENDPOINT || 'UG';
+const MATCH_ROUTER_JOIN = new RegExp(process.env.MATCH_ROUTER_JOIN || '^JO$', 'i');
+const MATCH_USER_GET = new RegExp(process.env.MATCH_USER_GET || '^UG$', 'i');
 // Debug switches (set in Render > Environment, no code change needed):
 //   GREET=ack  -> send RouterJoinAck as soon as a client connects (tests "client waits for server first")
 //   AUTO_ACK=1 -> for unknown endpoints reply with the same service and endpoint+'Ack'
 const GREET = process.env.GREET || '';
 const AUTO_ACK = process.env.AUTO_ACK === '1';
-const ROUTER_SERVICE = process.env.ROUTER_SERVICE || 'Router';
+const ROUTER_SERVICE = process.env.ROUTER_SERVICE || 'r';
+// The client drops the socket after ~15-20s unless the router keeps sending heartbeats.
+const HB_ENDPOINT = process.env.HB_ENDPOINT || 'HB';
+const HB_MS = Number(process.env.HB_MS || 5000);
 
 // ---------------------------------------------------------------- FlatBuffers reader
 function readTable(buf, pos) {
@@ -190,6 +193,7 @@ wss.on('connection', (ws, req) => {
   const hdrs = { ...req.headers }; delete hdrs.cookie; delete hdrs.authorization;
   console.log(`[H] ${JSON.stringify(hdrs)}`);
   let playerId = null;
+  let hbTimer = null;
   ws.on('ping', (d) => console.log(`[ping from client] ${d.length}B`));
   ws.on('pong', () => console.log('[pong from client]'));
 
@@ -213,6 +217,9 @@ wss.on('connection', (ws, req) => {
       // RouterJoin: 0 Platform(i32), 1 BuildVersion, 2 DeviceID, 3 UserID
       try { const j = readRoot(p.payload); playerId = j.str(3) || p.userId || playerId; } catch (_) {}
       send(p.service, ROUTER_ACK_ENDPOINT, Buffer.alloc(0), p.sequenceId);
+      if (!hbTimer && HB_MS > 0) {
+        hbTimer = setInterval(() => { if (ws.readyState === 1) send(p.service, HB_ENDPOINT, Buffer.alloc(0), 0); }, HB_MS);
+      }
     } else if (MATCH_USER_GET.test(p.endpoint)) {
       // UserGet: 0 Name, 1 OS, 2 BuildVersion, 3 DeviceID, 4 IP, 5 AuthProviderID, 6 PlayerID, 7 AuthData, 8 CountryCode
       let name = 'Player', pid = '';
@@ -225,7 +232,7 @@ wss.on('connection', (ws, req) => {
     }
   });
 
-  ws.on('close', (c, r) => console.log(`[-] close code=${c} reason=${r && r.toString()} after=${Date.now() - t0}ms`));
+  ws.on('close', (c, r) => { if (hbTimer) clearInterval(hbTimer); console.log(`[-] close code=${c} reason=${r && r.toString()} after=${Date.now() - t0}ms`); });
   ws.on('error', (e) => console.log(`[!] ws error ${e.message}`));
 });
 
