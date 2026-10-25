@@ -1,0 +1,11 @@
+{
+  "name": "traitor-server",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "ws": "^8.16.0"
+  },
+  "scripts": {
+    "start": "node index.js"
+  }
+}
