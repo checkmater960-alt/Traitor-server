@@ -43,7 +43,7 @@ function newGameResponse(sess, ng) {
 }
 
 // ---------------------------------------------------------------- http
-const DOWNLOADS = new Set(['udp-server.js', 'netcode.js', 'fb.js']);
+const DOWNLOADS = new Set(['udp-server.js', 'udpserver.js', 'netcode.js', 'fb.js']);
 const server = http.createServer((req, res) => {
   if (req.method === 'POST' && req.url === '/log') {
     let body = ''; req.on('data', (d) => { body += d; if (body.length > 65536) req.destroy(); });
@@ -51,7 +51,10 @@ const server = http.createServer((req, res) => {
     return;
   }
   const m = req.url.match(/^\/dl\/([\w.-]+)$/);
-  if (m && DOWNLOADS.has(m[1])) { res.writeHead(200, { 'content-type': 'text/plain' }); return res.end(fs.readFileSync(path.join(__dirname, m[1]))); }
+  if (m && DOWNLOADS.has(m[1])) {
+    try { const body = fs.readFileSync(path.join(__dirname, m[1])); res.writeHead(200, { 'content-type': 'text/plain' }); return res.end(body); }
+    catch (e) { res.writeHead(404); return res.end('missing ' + m[1]); }
+  }
   res.writeHead(200); res.end('traitor server ok\n');
 });
 const wss = new WebSocketServer({ server });
