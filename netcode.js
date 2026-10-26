@@ -72,11 +72,11 @@ function createConnectToken({ clientId, servers, timeoutSec = 15, expirySec = 30
   const addr = writeAddr(servers); addr.copy(priv, o); o += addr.length;
   c2s.copy(priv, o); o += 32; s2c.copy(priv, o); o += 32;
   Buffer.from(userData).subarray(0, 256).copy(priv, o);
-  const nonce = crypto.randomBytes(24);
+  const seqBuf = crypto.randomBytes(8); const tokenSeq = seqBuf.readBigUInt64LE(0);
   const aad = Buffer.concat([VERSION, u64le(protocolId), u64le(expire)]);
-  const encPriv = xchachaEncrypt(privateKey, nonce, aad, priv); // 1024 bytes
-  const head = Buffer.alloc(13 + 8 + 8 + 8 + 24);
-  VERSION.copy(head, 0); head.writeBigUInt64LE(BigInt(protocolId), 13); head.writeBigUInt64LE(now, 21); head.writeBigUInt64LE(expire, 29); nonce.copy(head, 37);
+  const encPriv = aeadEncrypt(privateKey, pktNonce(tokenSeq), aad, priv); // 1024 bytes
+  const head = Buffer.alloc(13 + 8 + 8 + 8 + 8);
+  VERSION.copy(head, 0); head.writeBigUInt64LE(BigInt(protocolId), 13); head.writeBigUInt64LE(now, 21); head.writeBigUInt64LE(expire, 29); head.writeBigUInt64LE(tokenSeq, 37);
   const tail = Buffer.alloc(8); tail.writeUInt32LE(timeoutSec, 0); tail.writeUInt32LE(servers.length, 4);
   const tok = Buffer.concat([head, encPriv, tail, addr, c2s, s2c]);
   return Buffer.concat([tok, Buffer.alloc(2048 - tok.length)]);
@@ -150,12 +150,12 @@ class NetcodeServer extends EventEmitter {
     else if (type === T.RESPONSE) this.sendKeepAlive(known);
   }
   onRequest(msg, rinfo, key) {
-    if (msg.length !== 1078) { this.log(`bad request size ${msg.length} from ${key}`); return; }
+    if (msg.length !== 1062) { this.log(`bad request size ${msg.length} from ${key}`); return; }
     if (!msg.subarray(1, 14).equals(VERSION)) { this.log('bad version info: ' + msg.subarray(1, 14).toString('latin1')); return; }
-    const protocolId = msg.readBigUInt64LE(14); const expire = msg.readBigUInt64LE(22);
+    const protocolId = msg.readBigUInt64LE(14); const expire = msg.readBigUInt64LE(22); const tokenSeq = msg.readBigUInt64LE(30);
     if (protocolId !== this.protocolId) { this.log('bad protocol id ' + protocolId.toString(16)); return; }
-    const nonce = msg.subarray(30, 54); const enc = msg.subarray(54, 1078);
-    const priv = xchachaDecrypt(this.privateKey, nonce, Buffer.concat([VERSION, u64le(protocolId), u64le(expire)]), enc);
+    const enc = msg.subarray(38, 1062);
+    const priv = aeadDecrypt(this.privateKey, pktNonce(tokenSeq), Buffer.concat([VERSION, u64le(protocolId), u64le(expire)]), enc);
     if (!priv) { this.log('connect token private data failed to decrypt'); return; }
     let o = 0; const clientId = priv.readBigUInt64LE(o); o += 8; const timeoutSec = priv.readUInt32LE(o); o += 4;
     const n = priv.readUInt32LE(o); o += 4; o += n * 7;
