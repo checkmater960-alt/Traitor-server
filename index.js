@@ -1,249 +1,95 @@
-// Traitor: Zombie Amongst Us (v0.12.04) - private server emulator (WebSocket + FlatBuffers)
-// Only dependency: ws.  Deploy on Render as a Web Service (build: npm install, start: node index.js)
-//
-// Wire format (from Assembly-CSharp dump): every WS binary message is a FlatBuffers `Packets.Packet`
-//   Packet { 0 Service:string, 1 Endpoint:string, 2 Payload:[ubyte], 3 SequenceID:int,
-//            4 UserID:string, 5 DeviceID:string, 6 IP:string, 7 Country:string }
-// The Payload itself is another FlatBuffers table (RouterJoin, UserGet, UserGetResponse ...).
-// Slot numbers are the order of the generated Create*/Add* methods, so they should match.
-//
-// NOTE: real service/endpoint names are NOT visible in dump.cs, so every packet is logged.
-// Run the game once, read the Render logs, and set the env vars below to the real names.
-
+// Traitor: Zombie Amongst Us (v0.12.04) - private server (Render): WebSocket router + matchmaker.
+// The real-time game runs in udp-server.js (Termux / any UDP host); this service only issues connect tokens.
+// Wire format: every WS binary message is a FlatBuffers Packets.Packet { 0 Service, 1 Endpoint, 2 Payload, 3 SequenceID, 4 UserID ... }
+//   services: r = router, u = user service, mm = matchmaker, f = friends
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
+const { readRoot, buildBuffer, F, W } = require('./fb');
+const { createConnectToken } = require('./netcode');
 
 const PORT = process.env.PORT || 3000;
-const ROUTER_ACK_ENDPOINT = process.env.ROUTER_ACK_ENDPOINT || 'JA';
-const USERGET_RESP_ENDPOINT = process.env.USERGET_RESP_ENDPOINT || 'UG';
-const MATCH_ROUTER_JOIN = new RegExp(process.env.MATCH_ROUTER_JOIN || '^JO$', 'i');
-const MATCH_USER_GET = new RegExp(process.env.MATCH_USER_GET || '^UG$', 'i');
-// Debug switches (set in Render > Environment, no code change needed):
-//   GREET=ack  -> send RouterJoinAck as soon as a client connects (tests "client waits for server first")
-//   AUTO_ACK=1 -> for unknown endpoints reply with the same service and endpoint+'Ack'
-const GREET = process.env.GREET || '';
-const AUTO_ACK = process.env.AUTO_ACK === '1';
-const ROUTER_SERVICE = process.env.ROUTER_SERVICE || 'r';
-// The client drops the socket after ~15-20s unless the router keeps sending heartbeats.
-const HB_ENDPOINT = process.env.HB_ENDPOINT || 'HB';
+const UDP_HOST = process.env.UDP_HOST || '127.0.0.1'; // where the game finds the UDP server (127.0.0.1 = same phone)
+const UDP_PORT = Number(process.env.UDP_PORT || 40000);
 const HB_MS = Number(process.env.HB_MS || 5000);
 
-// ---------------------------------------------------------------- FlatBuffers reader
-function readTable(buf, pos) {
-  const vt = pos - buf.readInt32LE(pos);
-  const vtSize = buf.readUInt16LE(vt);
-  const field = (slot) => {
-    const o = 4 + slot * 2;
-    if (o >= vtSize) return 0;
-    const rel = buf.readUInt16LE(vt + o);
-    return rel ? pos + rel : 0;
-  };
-  return {
-    str(slot) {
-      const f = field(slot);
-      if (!f) return '';
-      const p = f + buf.readUInt32LE(f);
-      return buf.toString('utf8', p + 4, p + 4 + buf.readUInt32LE(p));
-    },
-    bytes(slot) {
-      const f = field(slot);
-      if (!f) return Buffer.alloc(0);
-      const p = f + buf.readUInt32LE(f);
-      return buf.subarray(p + 4, p + 4 + buf.readUInt32LE(p));
-    },
-    i8: (slot) => { const f = field(slot); return f ? buf.readInt8(f) : 0; },
-    i32: (slot) => { const f = field(slot); return f ? buf.readInt32LE(f) : 0; },
-  };
-}
-const readRoot = (buf) => readTable(buf, buf.readUInt32LE(0));
+const hex = (b, n = 64) => Buffer.from(b).subarray(0, n).toString('hex') + (b.length > n ? '...' : '');
 
-// ---------------------------------------------------------------- FlatBuffers writer (forward-built)
-// fields: array indexed by slot; entry = null | {t, v}
-// t: 'bool' | 'u8' | 'i8' | 'u16' | 'i16' | 'u32' | 'i32' | 'u64' | 'str' | 'bytes' | 'table'
-// for 'table', v is itself a fields array.
-const SIZE = { bool: 1, u8: 1, i8: 1, u16: 2, i16: 2, u32: 4, i32: 4, u64: 8, str: 4, bytes: 4, table: 4 };
-
-function buildBuffer(rootFields) {
-  const chunks = [Buffer.alloc(8)]; // [0..4) root offset, [4..8) padding (keeps 8-byte alignment)
-  let len = 8;
-  const push = (b) => { chunks.push(b); len += b.length; };
-  const align = (n) => { const pad = (n - (len % n)) % n; if (pad) push(Buffer.alloc(pad)); };
-  const patches = []; // {at, target}
-
-  function writeString(s) {
-    align(4);
-    const data = Buffer.from(s, 'utf8');
-    const pos = len;
-    const b = Buffer.alloc(4); b.writeUInt32LE(data.length); push(b);
-    push(data); push(Buffer.alloc(1));
-    return pos;
-  }
-  function writeBytes(data) {
-    align(4);
-    const pos = len;
-    const b = Buffer.alloc(4); b.writeUInt32LE(data.length); push(b);
-    push(Buffer.from(data));
-    return pos;
-  }
-  function writeTable(fields) {
-    // layout inside the table (offset 0 = soffset)
-    let off = 4; const rel = [];
-    let maxAlign = 4;
-    fields.forEach((f, slot) => {
-      if (!f) { rel[slot] = 0; return; }
-      const sz = SIZE[f.t];
-      if (sz > maxAlign) maxAlign = sz;
-      off = Math.ceil(off / sz) * sz;
-      rel[slot] = off; off += sz;
-    });
-    const tableSize = off;
-    // vtable
-    align(2);
-    const vtPos = len;
-    const vt = Buffer.alloc(4 + rel.length * 2);
-    vt.writeUInt16LE(vt.length, 0); vt.writeUInt16LE(tableSize, 2);
-    rel.forEach((r, i) => vt.writeUInt16LE(r || 0, 4 + i * 2));
-    push(vt);
-    align(maxAlign);
-    const tPos = len;
-    const tb = Buffer.alloc(tableSize);
-    tb.writeInt32LE(tPos - vtPos, 0);
-    const children = [];
-    fields.forEach((f, slot) => {
-      if (!f) return;
-      const o = rel[slot];
-      switch (f.t) {
-        case 'bool': case 'u8': tb.writeUInt8(f.v ? Number(f.v) : 0, o); break;
-        case 'i8': tb.writeInt8(f.v, o); break;
-        case 'u16': tb.writeUInt16LE(f.v, o); break;
-        case 'i16': tb.writeInt16LE(f.v, o); break;
-        case 'u32': tb.writeUInt32LE(f.v, o); break;
-        case 'i32': tb.writeInt32LE(f.v, o); break;
-        case 'u64': tb.writeBigUInt64LE(BigInt(f.v), o); break;
-        default: children.push({ at: tPos + o, f });
-      }
-    });
-    push(tb);
-    for (const c of children) {
-      let target;
-      if (c.f.t === 'str') target = writeString(c.f.v);
-      else if (c.f.t === 'bytes') target = writeBytes(c.f.v);
-      else target = writeTable(c.f.v);
-      patches.push({ at: c.at, target });
-    }
-    return tPos;
-  }
-
-  const root = writeTable(rootFields);
-  const out = Buffer.concat(chunks, len);
-  out.writeUInt32LE(root, 0);
-  for (const p of patches) out.writeUInt32LE(p.target - p.at, p.at);
-  return out;
-}
-
-// ---------------------------------------------------------------- Packet helpers
-const S = (v) => ({ t: 'str', v });
-function makePacket(service, endpoint, payload, sequenceId, userId) {
-  const f = [];
-  f[0] = S(service); f[1] = S(endpoint);
-  f[2] = { t: 'bytes', v: payload || Buffer.alloc(0) };
-  if (sequenceId) f[3] = { t: 'i32', v: sequenceId };
-  if (userId) f[4] = S(userId);
-  for (let i = 0; i < 8; i++) if (!f[i]) f[i] = null;
-  return buildBuffer(f);
+function makePacket(service, endpoint, payload, seq, userId) {
+  return buildBuffer([F.str(service), F.str(endpoint), F.bytes(payload || Buffer.alloc(0)), F.i32(seq), userId ? F.str(userId) : null]);
 }
 function parsePacket(buf) {
   const t = readRoot(buf);
-  return {
-    service: t.str(0), endpoint: t.str(1), payload: t.bytes(2),
-    sequenceId: t.i32(3), userId: t.str(4), deviceId: t.str(5),
-  };
+  return { service: t.str(0), endpoint: t.str(1), payload: t.bytes(2), seq: t.i32(3), userId: t.str(4) };
 }
 
-// UserGetResponse: 0 ID, 1 Name, 2 GameCode, 3 HasUpdate, 4 UpdateMsg, 5 ClientSettings(table),
-//                  6 NewUser, 7 ReferralLevelClaims(u32), 8 ServerTime(u64), 9 ADCohorts(u16)
-// ClientSettingsTable: 0 RateUsPopup(bool), 1 VoiceChatEnabled(bool)
-function makeUserGetResponse(id, name) {
-  const f = [];
-  f[0] = S(id);
-  f[1] = S(name || 'Player');
-  f[2] = S(crypto.randomBytes(3).toString('hex').toUpperCase());
-  f[3] = null;                                           // HasUpdate = false
-  f[4] = S('');
-  f[5] = { t: 'table', v: [null, null] };                // all settings off (no rate popup, no voice chat)
-  f[6] = null;                                           // NewUser = false
-  f[7] = null;                                           // ReferralLevelClaims = 0
-  f[8] = { t: 'u64', v: Date.now() };
-  f[9] = null;                                           // ADCohorts = 0
-  return buildBuffer(f);
+// UserGetResponse: 0 ID 1 Name 2 GameCode 3 HasUpdate 4 UpdateMsg 5 ClientSettings 6 NewUser 7 ReferralLevelClaims 8 ServerTime 9 ADCohorts
+function userGetResponse(id, name) {
+  return buildBuffer([F.str(id), F.str(name || 'Player'), F.str(crypto.randomBytes(3).toString('hex').toUpperCase()), null, F.str(''),
+    F.table([null, null]), null, null, F.u64(Date.now()), null]);
+}
+// NewGameResponse: 0 ConnectToken 1 ServerTime 2 RoomID 3 GameMode
+function newGameResponse(sess, ng) {
+  const roomId = crypto.randomBytes(3).toString('hex').toUpperCase();
+  const ud = JSON.stringify({ r: roomId, m: ng.mode, u: sess.playerId, n: sess.name, p: ng.priv ? 1 : 0, t: ng.traitors });
+  const token = createConnectToken({
+    clientId: BigInt('0x' + crypto.randomBytes(7).toString('hex')),
+    servers: [{ ip: UDP_HOST, port: UDP_PORT }], timeoutSec: 15, expirySec: 300, userData: Buffer.from(ud),
+  });
+  console.log(`[mm] new game room=${roomId} mode=${ng.mode} traitors=${ng.traitors} private=${ng.priv} -> udp ${UDP_HOST}:${UDP_PORT}`);
+  return buildBuffer([F.bytes(token), F.u64(Date.now()), F.str(roomId), F.i32(ng.mode)]);
 }
 
-// ---------------------------------------------------------------- server
-const server = http.createServer((req, res) => { res.writeHead(200); res.end('traitor emulator ok\n'); });
-const wss = new WebSocketServer({ server }); // accepts any path, including /ws
-
-const hex = (b, n = 96) => b.subarray(0, n).toString('hex') + (b.length > n ? '...' : '');
+// ---------------------------------------------------------------- http
+const DOWNLOADS = new Set(['udp-server.js', 'netcode.js', 'fb.js']);
+const server = http.createServer((req, res) => {
+  if (req.method === 'POST' && req.url === '/log') {
+    let body = ''; req.on('data', (d) => { body += d; if (body.length > 65536) req.destroy(); });
+    req.on('end', () => { try { for (const l of JSON.parse(body).lines || []) console.log('[udp] ' + String(l).slice(0, 600)); } catch (e) {} res.writeHead(200); res.end('ok'); });
+    return;
+  }
+  const m = req.url.match(/^\/dl\/([\w.-]+)$/);
+  if (m && DOWNLOADS.has(m[1])) { res.writeHead(200, { 'content-type': 'text/plain' }); return res.end(fs.readFileSync(path.join(__dirname, m[1]))); }
+  res.writeHead(200); res.end('traitor server ok\n');
+});
+const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws, req) => {
-  ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; });
-  const t0 = Date.now();
-  console.log(`[+] connect path=${req.url} ip=${req.headers['x-forwarded-for'] || req.socket.remoteAddress}`);
-  const hdrs = { ...req.headers }; delete hdrs.cookie; delete hdrs.authorization;
-  console.log(`[H] ${JSON.stringify(hdrs)}`);
-  let playerId = null;
-  let hbTimer = null;
-  ws.on('ping', (d) => console.log(`[ping from client] ${d.length}B`));
-  ws.on('pong', () => console.log('[pong from client]'));
-
+  ws.isAlive = true; ws.on('pong', () => { ws.isAlive = true; });
+  const sess = { playerId: '', name: 'Player' }; let hb = null; const t0 = Date.now();
+  console.log(`[+] connect ip=${req.headers['x-forwarded-for'] || req.socket.remoteAddress}`);
   const send = (service, endpoint, payload, seq) => {
-    const pkt = makePacket(service, endpoint, payload, seq, playerId || '');
-    ws.send(pkt, { binary: true });
-    console.log(`[>] ${service}/${endpoint} seq=${seq} payload=${payload ? payload.length : 0}B`);
+    ws.send(makePacket(service, endpoint, payload, seq, sess.playerId), { binary: true });
+    if (endpoint !== 'HB') console.log(`[>] ${service}/${endpoint} seq=${seq} payload=${payload ? payload.length : 0}B`);
   };
-
-  if (GREET === 'ack') send(ROUTER_SERVICE, ROUTER_ACK_ENDPOINT, Buffer.alloc(0), 0);
-
   ws.on('message', (data, isBinary) => {
+    if (!isBinary) return;
     const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-    if (!isBinary) { console.log(`[<] text: ${buf.toString().slice(0, 200)}`); return; }
-    let p;
-    try { p = parsePacket(buf); }
-    catch (e) { console.log(`[!] unparsable (${buf.length}B): ${hex(buf)}`); return; }
-    console.log(`[<] ${p.service}/${p.endpoint} seq=${p.sequenceId} user=${p.userId} payload=${p.payload.length}B hex=${hex(p.payload, 64)}`);
-
-    if (MATCH_ROUTER_JOIN.test(p.endpoint)) {
-      // RouterJoin: 0 Platform(i32), 1 BuildVersion, 2 DeviceID, 3 UserID
-      try { const j = readRoot(p.payload); playerId = j.str(3) || p.userId || playerId; } catch (_) {}
-      send(p.service, ROUTER_ACK_ENDPOINT, Buffer.alloc(0), p.sequenceId);
-      if (!hbTimer && HB_MS > 0) {
-        hbTimer = setInterval(() => { if (ws.readyState === 1) send(p.service, HB_ENDPOINT, Buffer.alloc(0), 0); }, HB_MS);
-      }
-    } else if (MATCH_USER_GET.test(p.endpoint)) {
-      // UserGet: 0 Name, 1 OS, 2 BuildVersion, 3 DeviceID, 4 IP, 5 AuthProviderID, 6 PlayerID, 7 AuthData, 8 CountryCode
+    let p; try { p = parsePacket(buf); } catch (e) { console.log(`[!] unparsable ${hex(buf)}`); return; }
+    if (p.endpoint !== 'HBA') console.log(`[<] ${p.service}/${p.endpoint} seq=${p.seq} payload=${p.payload.length}B ${hex(p.payload)}`);
+    const key = p.service + '/' + p.endpoint;
+    if (key === 'r/JO') {
+      try { const j = readRoot(p.payload); sess.playerId = j.str(3) || sess.playerId; } catch (e) {}
+      send(p.service, 'JA', Buffer.alloc(0), p.seq);
+      if (!hb && HB_MS > 0) hb = setInterval(() => { if (ws.readyState === 1) send('r', 'HB', Buffer.alloc(0), 0); }, HB_MS);
+    } else if (key === 'u/UG') {
       let name = 'Player', pid = '';
-      try { const u = readRoot(p.payload); name = u.str(0) || name; pid = u.str(6); } catch (_) {}
-      playerId = pid || playerId || p.userId || crypto.randomUUID();
-      send(p.service, USERGET_RESP_ENDPOINT, makeUserGetResponse(playerId, name), p.sequenceId);
-    } else {
-      console.log('[?] unhandled endpoint - add a handler once the real name/format is known');
-      if (AUTO_ACK) send(p.service, p.endpoint + 'Ack', Buffer.alloc(0), p.sequenceId);
+      try { const u = readRoot(p.payload); name = u.str(0) || name; pid = u.str(6); } catch (e) {}
+      sess.playerId = pid || sess.playerId || crypto.randomUUID(); sess.name = name;
+      send(p.service, 'UG', userGetResponse(sess.playerId, name), p.seq);
+    } else if (key === 'mm/NG') {
+      const t = readRoot(p.payload);
+      send(p.service, 'NG', newGameResponse(sess, { traitors: t.i32(0), priv: t.bool(1), lang: t.i32(2), mode: t.i32(3) }), p.seq);
+    } else if (key === 'f/G') {
+      send(p.service, 'G', buildBuffer([null, F.bytes(), F.bytes(), null]), p.seq); // no friends
+    } else if (p.endpoint !== 'HBA') {
+      console.log('[?] unhandled ' + key);
     }
   });
-
-  ws.on('close', (c, r) => { if (hbTimer) clearInterval(hbTimer); console.log(`[-] close code=${c} reason=${r && r.toString()} after=${Date.now() - t0}ms`); });
+  ws.on('close', (c) => { if (hb) clearInterval(hb); console.log(`[-] close code=${c} after=${Date.now() - t0}ms`); });
   ws.on('error', (e) => console.log(`[!] ws error ${e.message}`));
 });
-
-// keep Render's proxy from idling the socket out
-setInterval(() => {
-  wss.clients.forEach((ws) => {
-    if (!ws.isAlive) return ws.terminate();
-    ws.isAlive = false; ws.ping();
-  });
-}, 25000);
-
-server.listen(PORT, () => console.log(`listening on ${PORT}`));
-
-module.exports = { buildBuffer, readRoot, makePacket, parsePacket, makeUserGetResponse };
+setInterval(() => wss.clients.forEach((ws) => { if (!ws.isAlive) return ws.terminate(); ws.isAlive = false; ws.ping(); }), 25000);
+server.listen(PORT, () => console.log(`listening on ${PORT} (udp target ${UDP_HOST}:${UDP_PORT})`));
