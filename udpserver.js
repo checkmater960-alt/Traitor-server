@@ -119,4 +119,5 @@ function joinMatch(c, payload) {
 }
 
 server.start();
+setInterval(() => log(`alive rx=${server.rx} clients=${server.clients.size} pending=${server.pending.size} rooms=${rooms.size}`), 10000);
 log('traitor udp server started on ' + PORT);
