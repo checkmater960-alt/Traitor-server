@@ -106,7 +106,8 @@ class NetcodeServer extends EventEmitter {
     super(); Object.assign(this, { port, maxClients, protocolId, privateKey, log });
     this.challengeKey = crypto.randomBytes(32); this.challengeSeq = 0n;
     this.pending = new Map(); this.clients = new Map(); this.sock = dgram.createSocket('udp4');
-    this.sock.on('message', (m, r) => { try { this.onPacket(m, r); } catch (e) { this.log('netcode error ' + e.stack); } });
+    this.rx = 0;
+    this.sock.on('message', (m, r) => { this.rx++; if (this.rx <= 40) this.log(`rx#${this.rx} datagram from ${r.address}:${r.port} size=${m.length} first=${m[0]}`); try { this.onPacket(m, r); } catch (e) { this.log('netcode error ' + e.stack); } });
     this.sock.on('error', (e) => this.log('socket error ' + e.message));
   }
   start() {
