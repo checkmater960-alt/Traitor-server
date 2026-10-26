@@ -36,10 +36,11 @@ function newGameResponse(sess, ng) {
   const ud = JSON.stringify({ r: roomId, m: ng.mode, u: sess.playerId, n: sess.name, p: ng.priv ? 1 : 0, t: ng.traitors });
   const token = createConnectToken({
     clientId: BigInt('0x' + crypto.randomBytes(7).toString('hex')),
-    servers: [{ ip: UDP_HOST, port: UDP_PORT }], timeoutSec: 15, expirySec: 300, userData: Buffer.from(ud),
+    servers: [{ ip: UDP_HOST, port: UDP_PORT }], timeoutSec: 15, expirySec: 900, userData: Buffer.from(ud),
   });
   console.log(`[mm] new game room=${roomId} mode=${ng.mode} traitors=${ng.traitors} private=${ng.priv} -> udp ${UDP_HOST}:${UDP_PORT}`);
-  return buildBuffer([F.bytes(token), F.u64(Date.now()), F.str(roomId), F.i32(ng.mode)]);
+  // ServerTime is handed to the netcode client as its clock, so it must be unix SECONDS (same unit as the token timestamps)
+  return buildBuffer([F.bytes(token), F.u64(Math.floor(Date.now() / 1000)), F.str(roomId), F.i32(ng.mode)]);
 }
 
 // ---------------------------------------------------------------- http
