@@ -22,7 +22,7 @@ setInterval(async () => {
 const hex = (b, n = 80) => Buffer.from(b).subarray(0, n).toString('hex') + (b.length > n ? '...' : '');
 
 // ---------------------------------------------------------------- game endpoints (UDPPackets enum)
-const EP = { Handshake: 0, HandshakeAck: 1, Ping: 2, Pong: 3, InputState: 4, WorldState: 5, ChatMessage: 12, Ack: 19, JoinMatch: 20, PlayerJoin: 21, PlayerDisconnect: 22, GameStart: 23, GameEnd: 24 };
+const EP = { Handshake: 0, HandshakeAck: 1, Ping: 2, Pong: 3, InputState: 4, WorldState: 5, ChatMessage: 12, Ack: 19, JoinMatch: 20, PlayerJoin: 21, PlayerDisconnect: 22, GameStart: 23, GameEnd: 24, StartingSoon: 44, UpdateRoomSettings: 50 };
 const EPNAME = Object.fromEntries(Object.entries(EP).map(([k, v]) => [v, k]));
 
 // ---------------------------------------------------------------- wire framing: Segments{ seq, segNo, total, last, reliable, data=UDPPacket }
@@ -148,6 +148,32 @@ setInterval(() => {
   }
 }, TICK_MS);
 
+// ---------------------------------------------------------------- lobby -> game start (formats guessed from the client code)
+const START_DELAY_MS = Number(process.env.START_DELAY_MS || 12000);   // wait in the lobby before starting
+const AUTO_START = process.env.AUTO_START !== '0';
+function finalSettings(room) { // FinalGameSettings: 0 NumImposters 1 MaxPlayers 2 MinPlayers 3 GameEndTime (all u8)
+  return [W.u8(room.players.length >= 3 ? 1 : 0), W.u8(10), W.u8(1), W.u8(5)];
+}
+function broadcast(room, ep, payload) { for (const p of room.players) sendPackets(p.client, [{ ep, payload }]); }
+function scheduleStart(room) {
+  if (!AUTO_START || room.timer || room.started) return;
+  room.timer = setTimeout(() => {
+    room.timer = null; if (!room.players.length) return;
+    log(`room ${room.id}: wait over, ${room.players.length} player(s) -> UpdateRoomSettings + StartingSoon`);
+    broadcast(room, EP.UpdateRoomSettings, buildBuffer(finalSettings(room)));
+    setTimeout(() => broadcast(room, EP.StartingSoon, buildBuffer([])), 1500);
+    setTimeout(() => {
+      if (!room.players.length) return; room.started = true;
+      const n = room.players.length;
+      const imps = n >= 3 ? [room.players[Math.floor(Math.random() * n)].number] : [];
+      const tasks = [0, 1, 2, 3];
+      const gs = buildBuffer([F.bytes(Buffer.from(imps)), F.bytes(Buffer.from(tasks)), W.i32(tasks.length * n), null, F.table(finalSettings(room))]);
+      log(`room ${room.id}: GameStart imposters=${JSON.stringify(imps)} tasks=${tasks}`);
+      broadcast(room, EP.GameStart, gs);
+    }, 5000);
+  }, START_DELAY_MS);
+}
+
 function joinMatch(c, payload) {
   const room = c.room;
   // JoinMatchAck: 0 Success 1 Message 2 PlayerIndex 3 RoomID 4 GameSettings 5 CurrentGameState 6 Private 7 HostPlayerNumber 8..13 voice strings
@@ -158,6 +184,7 @@ function joinMatch(c, payload) {
     F.str(''), F.str(''), F.str(''), F.str(''), F.str(''), F.str(''),
   ]);
   sendPackets(c, [{ ep: EP.JoinMatch + 0, payload: ack }]);
+  scheduleStart(room);
   const others = room.players.filter((p) => p.client !== c);
   if (others.length) { const pj = buildBuffer([F.tvec([playerTable(c.player)])]); for (const o of others) sendPackets(o.client, [{ ep: EP.PlayerJoin, payload: pj }]); }
 }
