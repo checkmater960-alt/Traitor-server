@@ -22,7 +22,7 @@ setInterval(async () => {
 const hex = (b, n = 80) => Buffer.from(b).subarray(0, n).toString('hex') + (b.length > n ? '...' : '');
 
 // ---------------------------------------------------------------- game endpoints (UDPPackets enum)
-const EP = { Handshake: 0, HandshakeAck: 1, Ping: 2, Pong: 3, InputState: 4, WorldState: 5, Ack: 19, JoinMatch: 20, PlayerJoin: 21, PlayerDisconnect: 22, GameStart: 23, GameEnd: 24 };
+const EP = { Handshake: 0, HandshakeAck: 1, Ping: 2, Pong: 3, InputState: 4, WorldState: 5, ChatMessage: 12, Ack: 19, JoinMatch: 20, PlayerJoin: 21, PlayerDisconnect: 22, GameStart: 23, GameEnd: 24 };
 const EPNAME = Object.fromEntries(Object.entries(EP).map(([k, v]) => [v, k]));
 
 // ---------------------------------------------------------------- wire framing: Segments{ seq, segNo, total, last, reliable, data=UDPPacket }
@@ -111,25 +111,40 @@ function handle(c, ep, payload, seq) {
     case EP.Ping: sendPackets(c, [{ ep: EP.Pong, payload: Buffer.alloc(0) }]); break;
     case EP.JoinMatch: joinMatch(c, payload); break;
     case EP.InputState: onInput(c, payload); break;
+    case EP.ChatMessage: onChat(c, payload); break;
     default: break; // logged above; add handlers as the protocol becomes clear
   }
 }
 
-function onInput(c, payload) {
-  const t = readRoot(payload); const start = t.u32(0); const inputs = t.tvec(1); const p = c.player;
-  if (inputLogs < 12) { inputLogs++; log(`input start=${start} n=${inputs.length} ` + inputs.slice(0, 4).map((v) => `(${v.f32(0).toFixed(2)},${v.f32(1).toFixed(2)})`).join(' ')); }
-  inputs.forEach((v, i) => { p.x += v.f32(0) * SPEED * INPUT_DT; p.y += v.f32(1) * SPEED * INPUT_DT; p.pred = (start + i) >>> 0; });
+function onChat(c, payload) {
+  // ChatMessage: 0 PlayerNumber(u8) 1 Message(string) 2 Time(u64)
+  const t = readRoot(payload); const msg = t.str(1);
+  log(`chat #${c.player.number} ${c.player.name}: ${msg}`);
+  const out = buildBuffer([W.u8(c.player.number), F.str(msg), F.u64(Date.now())]);
+  for (const p of c.room.players) sendPackets(p.client, [{ ep: EP.ChatMessage, payload: out }]);
 }
 
-function worldState(room) {
+function onInput(c, payload) {
+  const t = readRoot(payload); const start = t.u32(0); const inputs = t.tvec(1); const p = c.player;
+  if (inputLogs < 6) { inputLogs++; log(`input start=${start} n=${inputs.length} ` + inputs.slice(0, 4).map((v) => `(${v.f32(0).toFixed(2)},${v.f32(1).toFixed(2)})`).join(' ')); }
+  // every packet re-sends the last 2-4 samples (loss protection) -> only apply ids we have not seen yet
+  inputs.forEach((v, i) => {
+    const id = (start + i) >>> 0;
+    if (p.lastInput !== undefined && id <= p.lastInput && p.lastInput - id < 100000) return;
+    p.x += v.f32(0) * SPEED * INPUT_DT; p.y += v.f32(1) * SPEED * INPUT_DT; p.lastInput = id;
+  });
+  p.pred = p.lastInput >>> 0;
+}
+
+function worldState(room, forClient) {
   // WorldState: 0 PlayerStates[]   PlayerState: 0 PlayerIndex(u8) 1 X(f64) 2 Y(f64) 3 PredictionID(u32)
-  return buildBuffer([F.tvec(room.players.map((p) => [W.u8(p.number), F.f64(p.x), F.f64(p.y), F.u32(p.pred)]))]);
+  return buildBuffer([F.tvec(room.players.map((p) => [W.u8(p.number), F.f64(p.x), F.f64(p.y), p.client === forClient ? null : F.u32(p.pred)]))]);
 }
 setInterval(() => {
   for (const room of rooms.values()) {
-    if (!room.players.length) continue;
-    const ws = worldState(room);
-    for (const p of room.players) { try { sendPackets(p.client, [{ ep: EP.WorldState, payload: ws }], false, true); } catch (e) {} }
+    for (const p of room.players) {
+      try { sendPackets(p.client, [{ ep: EP.WorldState, payload: worldState(room, p.client) }], false, true); } catch (e) {}
+    }
   }
 }, TICK_MS);
 
