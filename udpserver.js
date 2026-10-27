@@ -33,6 +33,13 @@ function segment(data, seq, reliable) {
   return buildBuffer([F.u16(seq), F.u8(0), W.u8(1), F.bool(true), F.bool(reliable), F.bytes(data)]);
 }
 
+// ---------------------------------------------------------------- world simulation
+const SPAWN = { x: Number(process.env.SPAWN_X || 0), y: Number(process.env.SPAWN_Y || 0) };
+const SPEED = Number(process.env.SPEED || 3);          // world units per second at full stick (tune from rubber-banding)
+const INPUT_DT = Number(process.env.INPUT_DT || 1 / 30); // seconds covered by one input sample
+const TICK_MS = 50;                                      // WorldState broadcast rate (20 Hz)
+let inputLogs = 0;
+
 // ---------------------------------------------------------------- rooms
 const rooms = new Map();
 function getRoom(id, mode) {
@@ -53,12 +60,12 @@ function playerTable(p) {
 // ---------------------------------------------------------------- server
 const server = new NetcodeServer({ port: PORT, log });
 
-function sendPackets(c, packets, reliable = false) {
+function sendPackets(c, packets, reliable = false, quiet = false) {
   c.seq = ((c.seq || 0) + 1) & 0xffff;
   const inner = udpPacket(packets.map((p) => packetTable(p.ep, '', p.payload || Buffer.alloc(0), (c.pseq = ((c.pseq || 0) + 1) & 0xffff))), reliable);
   const seg = segment(inner, c.seq, reliable);
   server.send(c, seg);
-  for (const p of packets) log(`>> ${EPNAME[p.ep] ?? p.ep} ${hex(p.payload || [])}`);
+  if (!quiet) for (const p of packets) log(`>> ${EPNAME[p.ep] ?? p.ep} ${hex(p.payload || [])}`);
 }
 
 server.on('connect', (c) => {
@@ -66,7 +73,7 @@ server.on('connect', (c) => {
   c.info = ud; c.recv = new Set();
   const room = getRoom(ud.r || 'ROOM01', ud.m);
   const number = room.players.length;
-  c.player = { number, color: number % 12, name: ud.n || ('Player' + (number + 1)), session: ud.u || String(c.clientId), client: c };
+  c.player = { number, color: number % 12, name: ud.n || ('Player' + (number + 1)), session: ud.u || String(c.clientId), client: c, x: SPAWN.x, y: SPAWN.y, pred: 0 };
   room.players.push(c.player); c.room = room;
   log(`player ${c.player.name} joined room ${room.id} as #${number} userData=${JSON.stringify(ud)}`);
 });
@@ -102,9 +109,28 @@ function handle(c, ep, payload, seq) {
     case EP.Handshake: sendPackets(c, [{ ep: EP.HandshakeAck, payload: Buffer.alloc(0) }]); break;
     case EP.Ping: sendPackets(c, [{ ep: EP.Pong, payload: Buffer.alloc(0) }]); break;
     case EP.JoinMatch: joinMatch(c, payload); break;
+    case EP.InputState: onInput(c, payload); break;
     default: break; // logged above; add handlers as the protocol becomes clear
   }
 }
+
+function onInput(c, payload) {
+  const t = readRoot(payload); const start = t.u32(0); const inputs = t.tvec(1); const p = c.player;
+  if (inputLogs < 12) { inputLogs++; log(`input start=${start} n=${inputs.length} ` + inputs.slice(0, 4).map((v) => `(${v.f32(0).toFixed(2)},${v.f32(1).toFixed(2)})`).join(' ')); }
+  inputs.forEach((v, i) => { p.x += v.f32(0) * SPEED * INPUT_DT; p.y += v.f32(1) * SPEED * INPUT_DT; p.pred = (start + i) >>> 0; });
+}
+
+function worldState(room) {
+  // WorldState: 0 PlayerStates[]   PlayerState: 0 PlayerIndex(u8) 1 X(f64) 2 Y(f64) 3 PredictionID(u32)
+  return buildBuffer([F.tvec(room.players.map((p) => [W.u8(p.number), F.f64(p.x), F.f64(p.y), F.u32(p.pred)]))]);
+}
+setInterval(() => {
+  for (const room of rooms.values()) {
+    if (!room.players.length) continue;
+    const ws = worldState(room);
+    for (const p of room.players) { try { sendPackets(p.client, [{ ep: EP.WorldState, payload: ws }], false, true); } catch (e) {} }
+  }
+}, TICK_MS);
 
 function joinMatch(c, payload) {
   const room = c.room;
@@ -116,6 +142,8 @@ function joinMatch(c, payload) {
     F.str(''), F.str(''), F.str(''), F.str(''), F.str(''), F.str(''),
   ]);
   sendPackets(c, [{ ep: EP.JoinMatch + 0, payload: ack }]);
+  const others = room.players.filter((p) => p.client !== c);
+  if (others.length) { const pj = buildBuffer([F.tvec([playerTable(c.player)])]); for (const o of others) sendPackets(o.client, [{ ep: EP.PlayerJoin, payload: pj }]); }
 }
 
 server.start();
