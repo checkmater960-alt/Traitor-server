@@ -44,7 +44,7 @@ let inputLogs = 0;
 const rooms = new Map();
 function getRoom(id, mode) {
   let r = rooms.get(id);
-  if (!r) { r = { id, mode: mode || 0, players: [], host: 0, started: false }; rooms.set(id, r); log(`room ${id} created mode=${mode}`); }
+  if (!r) { r = { id, mode: mode || 0, players: [], host: 1, started: false }; rooms.set(id, r); log(`room ${id} created mode=${mode}`); }
   return r;
 }
 function settingsTable(room) {
@@ -72,8 +72,9 @@ server.on('connect', (c) => {
   let ud = {}; try { ud = JSON.parse(c.userData.toString('utf8').replace(/\0+$/, '')); } catch (e) {}
   c.info = ud; c.recv = new Set();
   const room = getRoom(ud.r || 'ROOM01', ud.m);
-  const number = room.players.length;
-  c.player = { number, color: number % 12, name: ud.n || ('Player' + (number + 1)), session: ud.u || String(c.clientId), client: c, x: SPAWN.x, y: SPAWN.y, pred: 0 };
+  // player numbers are 1-based in the game client (it indexes lists with number-1)
+  let number = 1; const taken = new Set(room.players.map((p) => p.number)); while (taken.has(number)) number++;
+  c.player = { number, color: (number - 1) % 12, name: ud.n || ('Player' + number), session: ud.u || String(c.clientId), client: c, x: SPAWN.x, y: SPAWN.y, pred: 0 };
   room.players.push(c.player); c.room = room;
   log(`player ${c.player.name} joined room ${room.id} as #${number} userData=${JSON.stringify(ud)}`);
 });
