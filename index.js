@@ -25,12 +25,15 @@ function parsePacket(buf) {
   return { service: t.str(0), endpoint: t.str(1), payload: t.bytes(2), seq: t.i32(3), userId: t.str(4) };
 }
 
-// UserGetResponse: 0 ID 1 Name 2 GameCode 3 HasUpdate 4 UpdateMsg 5 ClientSettings 6 NewUser 7 ReferralLevelClaims 8 ServerTime 9 ADCohorts
+// NOTE: the game's vtable slots have gaps (checked against the client code), so slots are written explicitly.
+// UserGetResponse: 0 ID, 1 Name, 3 GameCode, 8 HasUpdate, 9 UpdateMsg, 10 ClientSettings{0 RateUsPopup,1 VoiceChat}, 12 NewUser, 13 ReferralLevelClaims, 16 ServerTime, 17 ADCohorts
 const names = new Map(); // playerId -> chosen name (in memory; resets when Render restarts)
 function gameCode(id) { return crypto.createHash('sha1').update(String(id)).digest('hex').slice(0, 6).toUpperCase(); }
 function userGetResponse(id, name) {
-  return buildBuffer([F.str(id), F.str(name || 'Player'), F.str(gameCode(id)), null, F.str(''),
-    F.table([null, null]), null, null, F.u64(Date.now()), null]);
+  const f = new Array(18).fill(null);
+  f[0] = F.str(id); f[1] = F.str(name || 'Player'); f[3] = F.str(gameCode(id));
+  f[9] = F.str(''); f[10] = F.table([null, null]); f[16] = F.u64(Math.floor(Date.now() / 1000));
+  return buildBuffer(f);
 }
 // NewGameResponse: 0 ConnectToken 1 ServerTime 2 RoomID 3 GameMode
 function newGameResponse(sess, ng) {
@@ -91,12 +94,12 @@ wss.on('connection', (ws, req) => {
       let nm = ''; try { nm = readRoot(p.payload).str(0).trim().slice(0, 16); } catch (e) {}
       if (nm) { sess.name = nm; if (sess.playerId) names.set(sess.playerId, nm); }
       console.log(`[u] name change -> '${nm}'`);
-      send(p.service, 'UP', buildBuffer([F.bool(!!nm), F.str(sess.name)]), p.seq);
+      send(p.service, 'UP', buildBuffer([F.bool(!!nm), null, F.str(sess.name)]), p.seq); // UpdateProfileResponse: 0 Success, 2 Name
     } else if (key === 'mm/NG') {
       const t = readRoot(p.payload);
       send(p.service, 'NG', newGameResponse(sess, { traitors: t.i32(0), priv: t.bool(1), lang: t.i32(2), mode: t.i32(3) }), p.seq);
     } else if (key === 'f/G') {
-      send(p.service, 'G', buildBuffer([null, F.bytes(), F.bytes(), null]), p.seq); // no friends
+      send(p.service, 'G', buildBuffer([null, null, F.bytes(), F.bytes(), null]), p.seq); // GetFriendsResponse: 1 ErrorCode, 2 Friends, 3 FriendRequests, 4 Hash (no friends)
     } else if (p.endpoint !== 'HBA') {
       console.log('[?] unhandled ' + key);
     }
