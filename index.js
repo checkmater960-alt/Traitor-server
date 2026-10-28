@@ -26,8 +26,10 @@ function parsePacket(buf) {
 }
 
 // UserGetResponse: 0 ID 1 Name 2 GameCode 3 HasUpdate 4 UpdateMsg 5 ClientSettings 6 NewUser 7 ReferralLevelClaims 8 ServerTime 9 ADCohorts
+const names = new Map(); // playerId -> chosen name (in memory; resets when Render restarts)
+function gameCode(id) { return crypto.createHash('sha1').update(String(id)).digest('hex').slice(0, 6).toUpperCase(); }
 function userGetResponse(id, name) {
-  return buildBuffer([F.str(id), F.str(name || 'Player'), F.str(crypto.randomBytes(3).toString('hex').toUpperCase()), null, F.str(''),
+  return buildBuffer([F.str(id), F.str(name || 'Player'), F.str(gameCode(id)), null, F.str(''),
     F.table([null, null]), null, null, F.u64(Date.now()), null]);
 }
 // NewGameResponse: 0 ConnectToken 1 ServerTime 2 RoomID 3 GameMode
@@ -81,8 +83,15 @@ wss.on('connection', (ws, req) => {
     } else if (key === 'u/UG') {
       let name = 'Player', pid = '';
       try { const u = readRoot(p.payload); name = u.str(0) || name; pid = u.str(6); } catch (e) {}
-      sess.playerId = pid || sess.playerId || crypto.randomUUID(); sess.name = name;
-      send(p.service, 'UG', userGetResponse(sess.playerId, name), p.seq);
+      sess.playerId = pid || sess.playerId || crypto.randomUUID();
+      sess.name = names.get(sess.playerId) || name; // a name picked earlier wins
+      send(p.service, 'UG', userGetResponse(sess.playerId, sess.name), p.seq);
+    } else if (key === 'u/UP') {
+      // UpdateProfile {0 Name} -> UpdateProfileResponse {0 Success, 1 Name}
+      let nm = ''; try { nm = readRoot(p.payload).str(0).trim().slice(0, 16); } catch (e) {}
+      if (nm) { sess.name = nm; if (sess.playerId) names.set(sess.playerId, nm); }
+      console.log(`[u] name change -> '${nm}'`);
+      send(p.service, 'UP', buildBuffer([F.bool(!!nm), F.str(sess.name)]), p.seq);
     } else if (key === 'mm/NG') {
       const t = readRoot(p.payload);
       send(p.service, 'NG', newGameResponse(sess, { traitors: t.i32(0), priv: t.bool(1), lang: t.i32(2), mode: t.i32(3) }), p.seq);
