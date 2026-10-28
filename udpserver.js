@@ -138,7 +138,7 @@ function onInput(c, payload) {
 
 function worldState(room, forClient) {
   // WorldState: 0 PlayerStates[]   PlayerState: 0 PlayerIndex(u8) 1 X(f64) 2 Y(f64) 3 PredictionID(u32)
-  return buildBuffer([F.tvec(room.players.map((p) => [W.u8(p.number), F.f64(p.x), F.f64(p.y), p.client === forClient ? null : F.u32(p.pred)]))]);
+  return buildBuffer([F.tvec(room.players.map((p) => [W.u8(p.number), F.f64(p.x), F.f64(p.y), F.u32(p.pred)]))]);
 }
 setInterval(() => {
   for (const room of rooms.values()) {
