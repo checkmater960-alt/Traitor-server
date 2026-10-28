@@ -53,8 +53,8 @@ function settingsTable(room) {
   return v.map((x) => W.u8(x));
 }
 function playerTable(p) {
-  // Player: 0 Number 1 Color 2 Imposter 3 Name 4 Hat 5 Pet 6 SessionID 7 Eyewear 8 Costume
-  return [W.u8(p.number), W.u8(p.color), F.bool(false), F.str(p.name), W.u8(0), W.u8(0), F.str(p.session), W.u8(0), W.u8(0)];
+  // Player: 0 Number 1 Color 2 Imposter 3 Name (4 unused) 5 Hat 6 Pet 7 SessionID 8 Eyewear 9 Costume
+  return [W.u8(p.number), W.u8(p.color), F.bool(false), F.str(p.name), null, W.u8(0), W.u8(0), F.str(p.session), W.u8(0), W.u8(0)]; // slot 4 is unused in the game's schema
 }
 
 // ---------------------------------------------------------------- server
@@ -167,7 +167,7 @@ function scheduleStart(room) {
       const n = room.players.length;
       const imps = n >= 3 ? [room.players[Math.floor(Math.random() * n)].number] : [];
       const tasks = [0, 1, 2, 3];
-      const gs = buildBuffer([F.bytes(Buffer.from(imps)), F.bytes(Buffer.from(tasks)), W.i32(tasks.length * n), null, F.table(finalSettings(room))]);
+      const gs = buildBuffer([F.bytes(Buffer.from(imps)), F.bytes(Buffer.from(tasks)), W.i32(tasks.length * n), null, null, F.table(finalSettings(room))]); // GameStart: 0 Imposters 1 Tasks 2 TotalTasks 3 SuperAgentTasks (4 unused) 5 GameSettings
       log(`room ${room.id}: GameStart imposters=${JSON.stringify(imps)} tasks=${tasks}`);
       broadcast(room, EP.GameStart, gs);
     }, 5000);
