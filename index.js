@@ -1,3 +1,4 @@
+
 // Traitor: Zombie Amongst Us (v0.12.04) - private server (Render): WebSocket router + matchmaker.
 // The real-time game runs in udp-server.js (Termux / any UDP host); this service only issues connect tokens.
 // Wire format: every WS binary message is a FlatBuffers Packets.Packet { 0 Service, 1 Endpoint, 2 Payload, 3 SequenceID, 4 UserID ... }
@@ -32,7 +33,8 @@ function gameCode(id) { return crypto.createHash('sha1').update(String(id)).dige
 function userGetResponse(id, name) {
   const f = new Array(18).fill(null);
   f[0] = F.str(id); f[1] = F.str(name || 'Player'); f[3] = F.str(gameCode(id));
-  f[9] = F.str(''); f[10] = F.table([null, null]); f[16] = F.u64(Math.floor(Date.now() / 1000));
+  f[9] = F.str(''); f[10] = F.table([null, F.bool(true)]); // ClientSettings: RateUsPopup off, VoiceChatEnabled on (the chat button depends on it)
+  f[16] = F.u64(Math.floor(Date.now() / 1000));
   return buildBuffer(f);
 }
 // NewGameResponse: 0 ConnectToken 1 ServerTime 2 RoomID 3 GameMode
