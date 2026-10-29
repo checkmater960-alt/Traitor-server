@@ -129,13 +129,13 @@ function buildBuffer(rootFields) {
 // field constructors
 const F = {
   bool: (v) => (v ? { t: 'bool', v: true } : null),
-  u8: (v) => (v ? { t: 'u8', v } : null), i32: (v) => (v ? { t: 'i32', v } : null),
+  i8: (v) => (v ? { t: 'i8', v } : null), u8: (v) => (v ? { t: 'u8', v } : null), i32: (v) => (v ? { t: 'i32', v } : null),
   u16: (v) => (v ? { t: 'u16', v } : null), u32: (v) => (v ? { t: 'u32', v } : null),
   u64: (v) => (v ? { t: 'u64', v } : null), f32: (v) => (v ? { t: 'f32', v } : null), f64: (v) => (v ? { t: 'f64', v } : null),
   str: (v) => ({ t: 'str', v: v || '' }), bytes: (v) => ({ t: 'bytes', v: v || Buffer.alloc(0) }),
   table: (v) => ({ t: 'table', v }), tvec: (v) => ({ t: 'tvec', v: v || [] }),
 };
 // always-written scalar (even when zero) for fields where an explicit value matters
-const W = { u8: (v) => ({ t: 'u8', v }), bool: (v) => ({ t: 'bool', v: !!v }), i32: (v) => ({ t: 'i32', v }), u16: (v) => ({ t: 'u16', v }) };
+const W = { i8: (v) => ({ t: 'i8', v }), u8: (v) => ({ t: 'u8', v }), bool: (v) => ({ t: 'bool', v: !!v }), i32: (v) => ({ t: 'i32', v }), u16: (v) => ({ t: 'u16', v }) };
 
 module.exports = { readTable, readRoot, buildBuffer, F, W };
