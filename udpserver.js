@@ -22,7 +22,7 @@ setInterval(async () => {
 const hex = (b, n = 80) => Buffer.from(b).subarray(0, n).toString('hex') + (b.length > n ? '...' : '');
 
 // ---------------------------------------------------------------- game endpoints (UDPPackets enum)
-const EP = { Handshake: 0, HandshakeAck: 1, Ping: 2, Pong: 3, InputState: 4, WorldState: 5, ChatMessage: 12, Ack: 19, JoinMatch: 20, PlayerJoin: 21, PlayerDisconnect: 22, GameStart: 23, GameEnd: 24, StartingSoon: 44, UpdateRoomSettings: 50 };
+const EP = { Handshake: 0, HandshakeAck: 1, Ping: 2, Pong: 3, InputState: 4, WorldState: 5, ChatMessage: 12, Ack: 19, JoinMatch: 20, PlayerJoin: 21, PlayerDisconnect: 22, GameStart: 23, GameEnd: 24, PlayerCustomize: 27, StartingSoon: 44, UpdateRoomSettings: 50, PlayerItemCustomize: 51 };
 const EPNAME = Object.fromEntries(Object.entries(EP).map(([k, v]) => [v, k]));
 
 // ---------------------------------------------------------------- wire framing: Segments{ seq, segNo, total, last, reliable, data=UDPPacket }
@@ -54,7 +54,7 @@ function settingsTable(room) {
 }
 function playerTable(p) {
   // Player: 0 Number 1 Color 2 Imposter 3 Name (4 unused) 5 Hat 6 Pet 7 SessionID 8 Eyewear 9 Costume
-  return [W.u8(p.number), W.u8(p.color), F.bool(false), F.str(p.name), null, W.u8(0), W.u8(0), F.str(p.session), W.u8(0), W.u8(0)]; // slot 4 is unused in the game's schema
+  return [W.u8(p.number), W.u8(p.color), F.bool(false), F.str(p.name), null, W.u8(p.hat || 0), W.u8(p.pet || 0), F.str(p.session), W.u8(p.eyewear || 0), W.u8(p.costume || 0)]; // slot 4 is unused in the game's schema
 }
 
 // ---------------------------------------------------------------- server
@@ -74,7 +74,7 @@ server.on('connect', (c) => {
   const room = getRoom(ud.r || 'ROOM01', ud.m);
   // player numbers are 1-based in the game client (it indexes lists with number-1)
   let number = 1; const taken = new Set(room.players.map((p) => p.number)); while (taken.has(number)) number++;
-  c.player = { number, color: (number - 1) % 12, name: ud.n || ('Player' + number), session: ud.u || String(c.clientId), client: c, x: SPAWN.x, y: SPAWN.y, pred: 0 };
+  c.player = { number, color: (number - 1) % 12, name: ud.n || ('Player' + number), session: ud.u || String(c.clientId), client: c, x: SPAWN.x, y: SPAWN.y, pred: 0, hat: 0, pet: 0, eyewear: 0, costume: 0 };
   room.players.push(c.player); c.room = room;
   log(`player ${c.player.name} joined room ${room.id} as #${number} userData=${JSON.stringify(ud)}`);
 });
@@ -112,6 +112,20 @@ function handle(c, ep, payload, seq) {
     case EP.JoinMatch: joinMatch(c, payload); break;
     case EP.InputState: onInput(c, payload); break;
     case EP.ChatMessage: onChat(c, payload); break;
+    case EP.PlayerCustomize: {   // PlayerCustomize {0 Color} -> PlayerCustomizeResponse {0 Initiator 1 PlayerNumber 2 ColorIndex}
+      const color = readRoot(payload).u8(0); c.player.color = color;
+      log(`color #${c.player.number} -> ${color}`);
+      broadcast(c.room, EP.PlayerCustomize, buildBuffer([W.u8(c.player.number), W.u8(c.player.number), W.u8(color)]));
+      break;
+    }
+    case EP.PlayerItemCustomize: { // {0 Hat 1 Pet 2 Eyewear 3 Costume} (sbyte) -> response {0 PlayerNumber 1 Hat 2 Pet 3 Eyewear 4 Costume}
+      const t = readRoot(payload); const p = c.player;
+      p.hat = t.i8(0); p.pet = t.i8(1); p.eyewear = t.i8(2); p.costume = t.i8(3);
+      log(`items #${p.number} hat=${p.hat} pet=${p.pet} eyewear=${p.eyewear} costume=${p.costume}`);
+      broadcast(c.room, EP.PlayerItemCustomize, buildBuffer([W.u8(p.number), W.i8(p.hat), W.i8(p.pet), W.i8(p.eyewear), W.i8(p.costume)]));
+      break;
+    }
+    case EP.GameStart: if (!c.room.started) { log(`host #${c.player.number} requested game start`); runStart(c.room); } break;
     default: break; // logged above; add handlers as the protocol becomes clear
   }
 }
@@ -155,23 +169,26 @@ function finalSettings(room) { // FinalGameSettings: 0 NumImposters 1 MaxPlayers
   return [W.u8(room.players.length >= 3 ? 1 : 0), W.u8(10), W.u8(1), W.u8(5)];
 }
 function broadcast(room, ep, payload) { for (const p of room.players) sendPackets(p.client, [{ ep, payload }]); }
+function runStart(room) {
+  if (room.timer) { clearTimeout(room.timer); room.timer = null; }
+  if (!room.players.length || room.starting || room.started) return;
+  room.starting = true;
+  log(`room ${room.id}: ${room.players.length} player(s) -> UpdateRoomSettings + StartingSoon`);
+  broadcast(room, EP.UpdateRoomSettings, buildBuffer(finalSettings(room)));
+  setTimeout(() => broadcast(room, EP.StartingSoon, buildBuffer([])), 1500);
+  setTimeout(() => {
+    if (!room.players.length) return; room.started = true;
+    const n = room.players.length;
+    const imps = n >= 3 ? [room.players[Math.floor(Math.random() * n)].number] : [];
+    const tasks = [0, 1, 2, 3];
+    const gs = buildBuffer([F.bytes(Buffer.from(imps)), F.bytes(Buffer.from(tasks)), W.i32(tasks.length * n), null, null, F.table(finalSettings(room))]); // GameStart: 0 Imposters 1 Tasks 2 TotalTasks 3 SuperAgentTasks (4 unused) 5 GameSettings
+    log(`room ${room.id}: GameStart imposters=${JSON.stringify(imps)} tasks=${tasks}`);
+    broadcast(room, EP.GameStart, gs);
+  }, 5000);
+}
 function scheduleStart(room) {
-  if (!AUTO_START || room.timer || room.started) return;
-  room.timer = setTimeout(() => {
-    room.timer = null; if (!room.players.length) return;
-    log(`room ${room.id}: wait over, ${room.players.length} player(s) -> UpdateRoomSettings + StartingSoon`);
-    broadcast(room, EP.UpdateRoomSettings, buildBuffer(finalSettings(room)));
-    setTimeout(() => broadcast(room, EP.StartingSoon, buildBuffer([])), 1500);
-    setTimeout(() => {
-      if (!room.players.length) return; room.started = true;
-      const n = room.players.length;
-      const imps = n >= 3 ? [room.players[Math.floor(Math.random() * n)].number] : [];
-      const tasks = [0, 1, 2, 3];
-      const gs = buildBuffer([F.bytes(Buffer.from(imps)), F.bytes(Buffer.from(tasks)), W.i32(tasks.length * n), null, null, F.table(finalSettings(room))]); // GameStart: 0 Imposters 1 Tasks 2 TotalTasks 3 SuperAgentTasks (4 unused) 5 GameSettings
-      log(`room ${room.id}: GameStart imposters=${JSON.stringify(imps)} tasks=${tasks}`);
-      broadcast(room, EP.GameStart, gs);
-    }, 5000);
-  }, START_DELAY_MS);
+  if (!AUTO_START || room.timer || room.started || room.starting) return;
+  room.timer = setTimeout(() => { room.timer = null; runStart(room); }, START_DELAY_MS);
 }
 
 function joinMatch(c, payload) {
