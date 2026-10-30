@@ -1,4 +1,3 @@
-
 // Traitor: Zombie Amongst Us (v0.12.04) - private server (Render): WebSocket router + matchmaker.
 // The real-time game runs in udp-server.js (Termux / any UDP host); this service only issues connect tokens.
 // Wire format: every WS binary message is a FlatBuffers Packets.Packet { 0 Service, 1 Endpoint, 2 Payload, 3 SequenceID, 4 UserID ... }
@@ -7,6 +6,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const dns = require('dns').promises;
 const { WebSocketServer } = require('ws');
 const { readRoot, buildBuffer, F, W } = require('./fb');
 const { createConnectToken } = require('./netcode');
@@ -37,15 +37,36 @@ function userGetResponse(id, name) {
   f[16] = F.u64(Math.floor(Date.now() / 1000));
   return buildBuffer(f);
 }
+// UDP_HOST may be an IPv4 address or a hostname (e.g. a playit.gg tunnel); the token needs a numeric IPv4.
+let hostCache = { name: '', ip: '', at: 0 };
+async function udpIp() {
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(UDP_HOST)) return UDP_HOST;
+  if (hostCache.name === UDP_HOST && Date.now() - hostCache.at < 60000) return hostCache.ip;
+  const r = await dns.lookup(UDP_HOST, { family: 4 });
+  hostCache = { name: UDP_HOST, ip: r.address, at: Date.now() };
+  console.log(`[mm] resolved ${UDP_HOST} -> ${r.address}`);
+  return r.address;
+}
+// Public games of the same mode share a room until it is full or the join window closes, so friends land together.
+const openRooms = new Map(); // mode -> { id, count, created }
+const ROOM_WINDOW_MS = Number(process.env.ROOM_WINDOW_MS || 90000);
+const ROOM_MAX = Number(process.env.ROOM_MAX || 10);
+const newRoomId = () => crypto.randomBytes(3).toString('hex').toUpperCase();
+function assignRoom(ng) {
+  if (ng.priv) return newRoomId();
+  let r = openRooms.get(ng.mode); const now = Date.now();
+  if (!r || r.count >= ROOM_MAX || now - r.created > ROOM_WINDOW_MS) { r = { id: newRoomId(), count: 0, created: now }; openRooms.set(ng.mode, r); }
+  r.count++; return r.id;
+}
 // NewGameResponse: 0 ConnectToken 1 ServerTime 2 RoomID 3 GameMode
-function newGameResponse(sess, ng) {
-  const roomId = crypto.randomBytes(3).toString('hex').toUpperCase();
+async function newGameResponse(sess, ng) {
+  const roomId = assignRoom(ng); const ip = await udpIp();
   const ud = JSON.stringify({ r: roomId, m: ng.mode, u: sess.playerId, n: sess.name, p: ng.priv ? 1 : 0, t: ng.traitors });
   const token = createConnectToken({
     clientId: BigInt('0x' + crypto.randomBytes(7).toString('hex')),
-    servers: [{ ip: UDP_HOST, port: UDP_PORT }], timeoutSec: 15, expirySec: 900, userData: Buffer.from(ud),
+    servers: [{ ip, port: UDP_PORT }], timeoutSec: 15, expirySec: 900, userData: Buffer.from(ud),
   });
-  console.log(`[mm] new game room=${roomId} mode=${ng.mode} traitors=${ng.traitors} private=${ng.priv} -> udp ${UDP_HOST}:${UDP_PORT}`);
+  console.log(`[mm] new game room=${roomId} mode=${ng.mode} traitors=${ng.traitors} private=${ng.priv} -> udp ${ip}:${UDP_PORT}`);
   // ServerTime is handed to the netcode client as its clock, so it must be unix SECONDS (same unit as the token timestamps)
   return buildBuffer([F.bytes(token), F.u64(Math.floor(Date.now() / 1000)), F.str(roomId), F.i32(ng.mode)]);
 }
@@ -99,7 +120,9 @@ wss.on('connection', (ws, req) => {
       send(p.service, 'UP', buildBuffer([F.bool(!!nm), null, F.str(sess.name)]), p.seq); // UpdateProfileResponse: 0 Success, 2 Name
     } else if (key === 'mm/NG') {
       const t = readRoot(p.payload);
-      send(p.service, 'NG', newGameResponse(sess, { traitors: t.i32(0), priv: t.bool(1), lang: t.i32(2), mode: t.i32(3) }), p.seq);
+      newGameResponse(sess, { traitors: t.i32(0), priv: t.bool(1), lang: t.i32(2), mode: t.i32(3) })
+        .then((buf) => send(p.service, 'NG', buf, p.seq))
+        .catch((e) => console.log('[mm] failed: ' + e.message));
     } else if (key === 'f/G') {
       send(p.service, 'G', buildBuffer([null, null, F.bytes(), F.bytes(), null]), p.seq); // GetFriendsResponse: 1 ErrorCode, 2 Friends, 3 FriendRequests, 4 Hash (no friends)
     } else if (p.endpoint !== 'HBA') {
