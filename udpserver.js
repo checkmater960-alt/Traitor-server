@@ -40,6 +40,10 @@ const INPUT_DT = Number(process.env.INPUT_DT || 1 / 30); // seconds covered by o
 const TICK_MS = 50;                                      // WorldState broadcast rate (20 Hz)
 let inputLogs = 0;
 
+// ---------------------------------------------------------------- per-mode player limits (Constants.GameMode: 0 MurderMystery/Lab Mystery, 1 Zombie, 2 SquidGame/Red Light Green Light, 3 HideNSeek)
+const MIN_BY_MODE = { 0: 4, 1: 6, 2: 6, 3: 4 };
+function minPlayers(room) { return Number(process.env['MIN_MODE_' + room.mode]) || MIN_BY_MODE[room.mode] || 4; }
+
 // ---------------------------------------------------------------- rooms
 const rooms = new Map();
 function getRoom(id, mode) {
@@ -49,7 +53,7 @@ function getRoom(id, mode) {
 }
 function settingsTable(room) {
   // OnlineGameSettings slots 0..21 (see dump)
-  const v = [1, 10, 1, 5, 3, 3, 30, 10, 10, 15, 30, 3, 10, 5, 10, 8, 12, 12, room.mode, 10, 10, 0];
+  const v = [1, 10, minPlayers(room), 5, 3, 3, 30, 10, 10, 15, 30, 3, 10, 5, 10, 8, 12, 12, room.mode, 10, 10, 0];
   return v.map((x) => W.u8(x));
 }
 function playerTable(p) {
@@ -79,7 +83,7 @@ server.on('connect', (c) => {
   log(`player ${c.player.name} joined room ${room.id} as #${number} userData=${JSON.stringify(ud)}`);
 });
 server.on('disconnect', (c) => {
-  if (c.room) { c.room.players = c.room.players.filter((p) => p.client !== c); log(`player left room ${c.room.id}`); if (!c.room.players.length) rooms.delete(c.room.id); }
+  if (c.room) { c.room.players = c.room.players.filter((p) => p.client !== c); log(`player left room ${c.room.id}`); if (!c.room.players.length) { clearTimeout(c.room.timer); rooms.delete(c.room.id); } else scheduleStart(c.room); }
 });
 
 server.on('data', (c, data) => {
@@ -125,7 +129,10 @@ function handle(c, ep, payload, seq) {
       broadcast(c.room, EP.PlayerItemCustomize, buildBuffer([W.u8(p.number), W.i8(p.hat), W.i8(p.pet), W.i8(p.eyewear), W.i8(p.costume)]));
       break;
     }
-    case EP.GameStart: if (!c.room.started) { log(`host #${c.player.number} requested game start`); runStart(c.room); } break;
+    case EP.GameStart:
+      if (c.room.players.length < minPlayers(c.room)) log(`start request ignored: ${c.room.players.length}/${minPlayers(c.room)} players`);
+      else if (!c.room.started) { log(`host #${c.player.number} requested game start`); runStart(c.room); }
+      break;
     default: break; // logged above; add handlers as the protocol becomes clear
   }
 }
@@ -166,7 +173,7 @@ setInterval(() => {
 const START_DELAY_MS = Number(process.env.START_DELAY_MS || 12000);   // wait in the lobby before starting
 const AUTO_START = process.env.AUTO_START !== '0';
 function finalSettings(room) { // FinalGameSettings: 0 NumImposters 1 MaxPlayers 2 MinPlayers 3 GameEndTime (all u8)
-  return [W.u8(room.players.length >= 3 ? 1 : 0), W.u8(10), W.u8(1), W.u8(5)];
+  return [W.u8(room.players.length >= 3 ? 1 : 0), W.u8(10), W.u8(minPlayers(room)), W.u8(5)];
 }
 function broadcast(room, ep, payload) { for (const p of room.players) sendPackets(p.client, [{ ep, payload }]); }
 function runStart(room) {
@@ -186,9 +193,12 @@ function runStart(room) {
     broadcast(room, EP.GameStart, gs);
   }, 5000);
 }
-function scheduleStart(room) {
-  if (!AUTO_START || room.timer || room.started || room.starting) return;
-  room.timer = setTimeout(() => { room.timer = null; runStart(room); }, START_DELAY_MS);
+function scheduleStart(room) { // (re)evaluated whenever somebody joins or leaves
+  if (!AUTO_START || room.started || room.starting) return;
+  const need = minPlayers(room);
+  if (room.players.length >= need) {
+    if (!room.timer) { log(`room ${room.id}: ${room.players.length}/${need} players, starting in ${START_DELAY_MS / 1000}s`); room.timer = setTimeout(() => { room.timer = null; runStart(room); }, START_DELAY_MS); }
+  } else if (room.timer) { clearTimeout(room.timer); room.timer = null; log(`room ${room.id}: below ${need} players, start cancelled`); }
 }
 
 function joinMatch(c, payload) {
