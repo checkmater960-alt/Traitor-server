@@ -49,14 +49,16 @@ async function udpIp() {
 }
 // Public games of the same mode share a room until it is full or the join window closes, so friends land together.
 const openRooms = new Map(); // mode -> { id, count, created }
-const ROOM_WINDOW_MS = Number(process.env.ROOM_WINDOW_MS || 90000);
+const ROOM_WINDOW_MS = Number(process.env.ROOM_WINDOW_MS || 180000); // a public room stays open this long after the LAST player was sent to it
 const ROOM_MAX = Number(process.env.ROOM_MAX || 10);
-const newRoomId = () => crypto.randomBytes(3).toString('hex').toUpperCase();
+const newRoomId = () => String(100000 + crypto.randomInt(900000)); // the game's code-entry box only accepts digits
+const known = new Map(); // roomId -> { mode, priv, created } (so a friend can join by code)
 function assignRoom(ng) {
-  if (ng.priv) return newRoomId();
+  if (ng.roomId) return ng.roomId;
+  if (ng.priv) { const id = newRoomId(); known.set(id, { mode: ng.mode, priv: true, created: Date.now() }); return id; }
   let r = openRooms.get(ng.mode); const now = Date.now();
-  if (!r || r.count >= ROOM_MAX || now - r.created > ROOM_WINDOW_MS) { r = { id: newRoomId(), count: 0, created: now }; openRooms.set(ng.mode, r); }
-  r.count++; return r.id;
+  if (!r || r.count >= ROOM_MAX || now - r.last > ROOM_WINDOW_MS) { r = { id: newRoomId(), count: 0, last: now }; openRooms.set(ng.mode, r); known.set(r.id, { mode: ng.mode, priv: false, created: now }); }
+  r.count++; r.last = now; return r.id;
 }
 // NewGameResponse: 0 ConnectToken 1 ServerTime 2 RoomID 3 GameMode
 async function newGameResponse(sess, ng) {
@@ -123,6 +125,17 @@ wss.on('connection', (ws, req) => {
       newGameResponse(sess, { traitors: t.i32(0), priv: t.bool(1), lang: t.i32(2), mode: t.i32(3) })
         .then((buf) => send(p.service, 'NG', buf, p.seq))
         .catch((e) => console.log('[mm] failed: ' + e.message));
+    } else if (p.service === 'mm' && p.endpoint !== 'NG') {
+      // FindRoom {0 RoomID} -> FindRoomAck {0 ErrorCode}; on success the matchmaker also sends the connect token (NewGameResponse)
+      let code = ''; try { code = readRoot(p.payload).str(0).trim(); } catch (e) {}
+      const info = known.get(code);
+      console.log(`[mm] find room '${code}' via ${key} -> ${info ? 'found' : 'not found'}`);
+      if (!info) { send(p.service, p.endpoint, buildBuffer([W.i32(1)]), p.seq); }
+      else {
+        send(p.service, p.endpoint, buildBuffer([]), p.seq);
+        newGameResponse(sess, { traitors: 0, priv: info.priv, mode: info.mode, roomId: code })
+          .then((buf) => send(p.service, 'NG', buf, 0)).catch((e) => console.log('[mm] failed: ' + e.message));
+      }
     } else if (key === 'f/G') {
       send(p.service, 'G', buildBuffer([null, null, F.bytes(), F.bytes(), null]), p.seq); // GetFriendsResponse: 1 ErrorCode, 2 Friends, 3 FriendRequests, 4 Hash (no friends)
     } else if (p.endpoint !== 'HBA') {
